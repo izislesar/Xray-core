@@ -1,0 +1,4 @@
+# Beads configuration for Xray-core
+# The database is initialized locally with `bd init --prefix xray`.
+# Keep task state in Beads; do not create parallel Markdown task lists.
+issue-prefix: "xray"
