@@ -1,0 +1,9 @@
+# Beads runtime/database state is local; repository task interchange stays explicit.
+embeddeddolt/
+dolt/
+*.db
+*.db-*
+*.lock
+*.pid
+*.sock
+hooks/
