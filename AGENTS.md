@@ -4,7 +4,10 @@
 
 Beads is the source of truth for task state in this repository. Do not create parallel task trackers in Markdown.
 
+If Beads is not initialized in the checkout, run `bash scripts/init-beads.sh` once, then continue with `bd prime`/`bd ready`.
+
 Before starting work:
+- Run `bd prime` for workflow context.
 - Run `bd ready` to find unblocked work.
 - Run `bd show <id>` for the issue being worked on.
 - Inspect dependencies before changing implementation.
