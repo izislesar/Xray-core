@@ -25,7 +25,10 @@ import (
 
 // Handler is managing object that tie together tun interface, ip stack and dispatch connections to the routing
 type Handler struct {
+	// ctx is detached from the instance's; cancel ends it, and with it every dispatch started from it,
+	// when the handler closes, since nothing else would
 	ctx             context.Context
+	cancel          context.CancelFunc
 	config          *Config
 	stack           Stack
 	tun             Tun
@@ -56,20 +59,21 @@ func (w *tunUDPStatsWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return nil
 }
 
-// tunTCPWriter is the writing side of a TCP connection for the dispatcher. It has no Close: the outbound closes
-// its writer when the other side has no more to send, and the system may still be sending
-type tunTCPWriter struct {
-	writer  buf.Writer
-	counter stats.Counter
+// TCPWriter is the writing side of a TCP connection of the stack for the dispatcher. It has no Close: the outbound
+// closes its writer when the other side has no more to send, and the system may still be sending
+type TCPWriter struct {
+	Writer buf.Writer
+	// Counter counts what is written, if there is one
+	Counter stats.Counter
 }
 
-func (w *tunTCPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+func (w *TCPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	size := mb.Len()
-	if err := w.writer.WriteMultiBuffer(mb); err != nil {
+	if err := w.Writer.WriteMultiBuffer(mb); err != nil {
 		return err
 	}
-	if w.counter != nil {
-		w.counter.Add(int64(size))
+	if w.Counter != nil {
+		w.Counter.Add(int64(size))
 	}
 	return nil
 }
@@ -95,7 +99,7 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 		t.sniffingRequest = content.SniffingRequest
 	}
 
-	t.ctx = core.ToBackgroundDetachedContext(ctx)
+	t.ctx, t.cancel = context.WithCancel(core.ToBackgroundDetachedContext(ctx))
 	t.policyManager = pm
 	t.dispatcher = dispatcher
 
@@ -143,7 +147,8 @@ func (t *Handler) Start() error {
 				errors.LogInfo(context.Background(), "[tun] falied to set interface > iface == nil")
 				return errors.New("iface not found")
 			}
-			return c.Control(func(fd uintptr) {
+			var controlErr, sockErr error
+			controlErr = c.Control(func(fd uintptr) {
 				addrPort, _ := netip.ParseAddrPort(address)
 				// skip loopback
 				if addrPort.Addr().IsLoopback() || strings.HasPrefix(strings.ToLower(address), "localhost:") {
@@ -151,9 +156,13 @@ func (t *Handler) Start() error {
 				}
 				err := setinterface(network, address, fd, iface)
 				if err != nil {
-					errors.LogInfoInner(context.Background(), err, "[tun] falied to set interface")
+					sockErr = errors.New("[tun] falied to set interface").Base(err)
 				}
 			})
+			if sockErr != nil {
+				return sockErr
+			}
+			return controlErr
 		})
 	}
 
@@ -243,7 +252,7 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	reader := &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn), Counter: t.uplinkCounter}
 	writer := buf.NewWriter(conn)
 	if destination.Network != net.Network_UDP {
-		writer = &tunTCPWriter{writer: writer, counter: t.downlinkCounter}
+		writer = &TCPWriter{Writer: writer, Counter: t.downlinkCounter}
 	} else if t.downlinkCounter != nil {
 		writer = &tunUDPStatsWriter{writer: writer, counter: t.downlinkCounter}
 	}
@@ -259,6 +268,11 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 
 // Close implements common.Closable.
 func (t *Handler) Close() error {
+	// cancel first so every dispatch in flight unwinds, then close the stack (resets TCP, ends UDP flows)
+	// and the tun
+	if t.cancel != nil {
+		t.cancel()
+	}
 	return errors.Combine(common.CloseIfExists(t.stack), common.CloseIfExists(t.tun))
 }
 

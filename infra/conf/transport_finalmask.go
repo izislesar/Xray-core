@@ -2,6 +2,8 @@ package conf
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -9,18 +11,25 @@ import (
 	"fmt"
 	"net/netip"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 
 	googleuuid "github.com/google/uuid"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/geodata"
+	xlua "github.com/xtls/xray-core/common/lua"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/finalmask/filter"
 	"github.com/xtls/xray-core/transport/internet/finalmask/fragment"
 	"github.com/xtls/xray-core/transport/internet/finalmask/header/custom"
 	"github.com/xtls/xray-core/transport/internet/finalmask/mkcp/aes128gcm"
 	"github.com/xtls/xray-core/transport/internet/finalmask/mkcp/header"
 	"github.com/xtls/xray-core/transport/internet/finalmask/mkcp/original"
 	"github.com/xtls/xray-core/transport/internet/finalmask/noise"
+	"github.com/xtls/xray-core/transport/internet/finalmask/proxyprotocol"
 	"github.com/xtls/xray-core/transport/internet/finalmask/realm"
 	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
 	"github.com/xtls/xray-core/transport/internet/finalmask/sudoku"
@@ -28,6 +37,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/finalmask/xdns"
 	"github.com/xtls/xray-core/transport/internet/finalmask/xicmp"
 	"github.com/xtls/xray-core/transport/internet/finalmask/xmc"
+	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"google.golang.org/protobuf/proto"
 )
@@ -70,13 +80,16 @@ var (
 	customVarNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 	tcpmaskLoader = NewJSONConfigLoader(ConfigCreatorCache{
-		"header-custom": func() interface{} { return new(HeaderCustomTCP) },
-		"fragment":      func() interface{} { return new(FragmentMask) },
-		"sudoku":        func() interface{} { return new(Sudoku) },
-		"xmc":           func() interface{} { return new(XMC) },
+		"filter":         func() interface{} { return new(Filter) },
+		"header-custom":  func() interface{} { return new(HeaderCustomTCP) },
+		"proxy-protocol": func() interface{} { return new(ProxyProtocol) },
+		"fragment":       func() interface{} { return new(FragmentMask) },
+		"sudoku":         func() interface{} { return new(Sudoku) },
+		"xmc":            func() interface{} { return new(XMC) },
 	}, "type", "settings")
 
 	udpmaskLoader = NewJSONConfigLoader(ConfigCreatorCache{
+		"filter":        func() interface{} { return new(Filter) },
 		"header-custom": func() interface{} { return new(HeaderCustomUDP) },
 		"mkcp-legacy":   func() interface{} { return new(MkcpLegacy) },
 		"noise":         func() interface{} { return new(NoiseMask) },
@@ -88,6 +101,49 @@ var (
 		"udphop":        func() interface{} { return new(UDPHop) },
 	}, "type", "settings")
 )
+
+type ProxyProtocol struct {
+	Version uint32 `json:"version"`
+}
+
+func (c *ProxyProtocol) Build() (proto.Message, error) {
+	version := c.Version
+	if version == 0 {
+		version = 2
+	}
+	if version != 1 && version != 2 {
+		return nil, errors.New("PROXY protocol version must be 1 or 2")
+	}
+	return &proxyprotocol.Config{Version: version}, nil
+}
+
+func addProxyProtocolMask(config *internet.StreamConfig, version uint32) {
+	mask := serial.ToTypedMessage(&proxyprotocol.Config{Version: version})
+	for _, existing := range config.Tcpmasks {
+		if existing.Type == mask.Type {
+			return
+		}
+	}
+	// Put the header directly on the socket, before the other masks.
+	config.Tcpmasks = append(config.Tcpmasks, mask)
+}
+
+type Filter struct {
+	BlockedSourceIPs []string `json:"blockedSourceIPs"`
+	AllowedSourceIPs []string `json:"allowedSourceIPs"`
+}
+
+func (c *Filter) Build() (proto.Message, error) {
+	rules, err := geodata.ParseIPRules(c.BlockedSourceIPs)
+	if err != nil {
+		return nil, errors.New(`invalid "blockedSourceIPs"`).Base(err)
+	}
+	allowed, err := geodata.ParseIPRules(c.AllowedSourceIPs)
+	if err != nil {
+		return nil, errors.New(`invalid "allowedSourceIPs"`).Base(err)
+	}
+	return &filter.Config{BlockedSourceIps: rules, AllowedSourceIps: allowed}, nil
+}
 
 type TCPItem struct {
 	Delay     Int32Range       `json:"delay"`
@@ -304,11 +360,26 @@ type NoiseItem struct {
 }
 
 type NoiseMask struct {
-	Reset Int32Range  `json:"reset"`
-	Noise []NoiseItem `json:"noise"`
+	Reset  Int32Range  `json:"reset"`
+	Noise  []NoiseItem `json:"noise"`
+	Script string      `json:"script"`
 }
 
 func (c *NoiseMask) Build() (proto.Message, error) {
+	if c.Script != "" {
+		if len(c.Noise) > 0 {
+			return nil, errors.New(`"script" and "noise" can't be used together`)
+		}
+		if _, err := xlua.Compile(c.Script); err != nil {
+			return nil, errors.New("failed to compile the noise script").Base(err)
+		}
+		return &noise.Config{
+			ResetMin: int64(c.Reset.From),
+			ResetMax: int64(c.Reset.To),
+			Script:   c.Script,
+		}, nil
+	}
+
 	noiseSlice := make([]*noise.Item, 0, len(c.Noise))
 	for _, item := range c.Noise {
 		if len(item.Packet) > 0 && item.Rand.To > 0 {
@@ -799,7 +870,10 @@ type XDNSDomain struct {
 }
 
 type XDNSResolver struct {
-	Addrs []string `json:"addrs"`
+	Addrs      []string          `json:"addrs"`
+	Worker     int32             `json:"worker"`
+	TlsConfig  *TLSConfig        `json:"tlsConfig"`
+	QuicConfig *QuicParamsConfig `json:"quicConfig"`
 }
 
 type XDNS struct {
@@ -834,6 +908,26 @@ func (c *XDNS) Build() (proto.Message, error) {
 		}
 	}
 	for i := range c.Resolvers {
+		worker := c.Resolvers[i].Worker
+		if worker == 0 {
+			worker = 32
+		}
+		var tlsConfig *tls.Config
+		var quicConfig *internet.QuicParams
+		if c.Resolvers[i].TlsConfig != nil {
+			proto, err := c.Resolvers[i].TlsConfig.Build()
+			if err != nil {
+				return nil, err
+			}
+			tlsConfig = proto.(*tls.Config)
+		}
+		if c.Resolvers[i].QuicConfig != nil {
+			proto, err := c.Resolvers[i].QuicConfig.Build()
+			if err != nil {
+				return nil, err
+			}
+			quicConfig = proto.(*internet.QuicParams)
+		}
 		for j := range c.Resolvers[i].Addrs {
 			var u *url.URL
 			var e error
@@ -845,18 +939,21 @@ func (c *XDNS) Build() (proto.Message, error) {
 			if e != nil {
 				return nil, e
 			}
+			var addr string
 			switch u.Scheme {
 			case "tcp", "udp":
+				host := u.Hostname()
+				port := u.Port()
+				if port == "" {
+					port = "53"
+				}
+				addr = net.JoinHostPort(host, port)
+			case "https":
+				addr = u.String()
 			default:
 				return nil, errors.New("invalid protocol")
 			}
-			var host, port string
-			host = u.Hostname()
-			port = u.Port()
-			if port == "" {
-				port = "53"
-			}
-			resolvers = append(resolvers, &xdns.ResolverProto{Type: u.Scheme, Addr: net.JoinHostPort(host, port)})
+			resolvers = append(resolvers, &xdns.ResolverProto{Type: u.Scheme, Addr: addr, Worker: worker, TlsConfig: tlsConfig, QuicConfig: quicConfig})
 		}
 	}
 	if c.ExtraPoll < 0 || c.ExtraPoll > 3 {
@@ -866,9 +963,39 @@ func (c *XDNS) Build() (proto.Message, error) {
 }
 
 type XMC struct {
-	Hostname string       `json:"hostname"`
-	Profiles []XMCProfile `json:"profiles"`
-	Password string       `json:"password"`
+	Hostname  string           `json:"hostname"`
+	Profiles  []XMCProfile     `json:"profiles"`
+	Password  string           `json:"password"`
+	Paddings  []XMCPaddingTurn `json:"paddings,omitempty"`
+	Yggdrasil *XMCYggdrasil    `json:"yggdrasil,omitempty"`
+	// A configured list is the complete padding schedule and replaces the
+	// built-in preset entirely, including the preset's Play-state join tail.
+	// NoPadding disables padding. An explicit empty "paddings" array means the
+	// same; an absent one keeps the built-in preset.
+	NoPadding bool `json:"noPadding,omitempty"`
+}
+
+type XMCPaddingTurn struct {
+	Length    string `json:"length"`
+	Direction string `json:"direction"`
+	// Delay is an optional millisecond value or inclusive min-max range: the
+	// pause that leads into this turn, written on the turn that follows the gap
+	// it reproduces. The sending side samples the range, the peer spends its
+	// minimum, and nothing pauses after the last turn.
+	Delay string `json:"delay,omitempty"`
+}
+
+// XMCYggdrasil enables third-party login through a Yggdrasil API server such
+// as Blessing Skin. The client authenticates with the API and the server
+// verifies players through its hasJoined endpoint.
+type XMCYggdrasil struct {
+	// API root of the Yggdrasil API, for example
+	// https://skin.example.com/api/yggdrasil
+	API      string `json:"api"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	// Optional player name, required when the account owns several players.
+	Player string `json:"player"`
 }
 
 type XMCProfile struct {
@@ -904,17 +1031,115 @@ func (c *XMCProfile) Build() (*xmc.Profile, error) {
 }
 
 func (c *XMC) Build() (proto.Message, error) {
-	if len(c.Profiles) == 0 {
+	// An explicit empty array is different from an absent field: json leaves
+	// Paddings nil when it is absent, so the user can turn padding off without
+	// a second switch.
+	noPadding := c.NoPadding || (c.Paddings != nil && len(c.Paddings) == 0)
+	if noPadding && len(c.Paddings) > 0 {
+		return nil, fmt.Errorf("minecraft padding: noPadding and paddings are exclusive")
+	}
+	config := &xmc.Config{Hostname: c.Hostname, NoPadding: noPadding}
+	for i, turn := range c.Paddings {
+		minimum, maximum, err := ParseRangeString(turn.Length)
+		if err != nil {
+			return nil, fmt.Errorf("minecraft padding turn %d length: %w", i, err)
+		}
+		delayMinimum, delayMaximum, err := ParseRangeString(turn.Delay)
+		if err != nil {
+			return nil, fmt.Errorf("minecraft padding turn %d delay: %w", i, err)
+		}
+
+		var direction int32
+		switch turn.Direction {
+		case "c2s", "client-to-server":
+			direction = 1
+		case "s2c", "server-to-client":
+			direction = 2
+		default:
+			return nil, fmt.Errorf("minecraft padding turn %d: invalid direction %q (must be \"c2s\" or \"s2c\")", i, turn.Direction)
+		}
+
+		config.Paddings = append(config.Paddings, &xmc.Padding{
+			LengthMin: int64(minimum),
+			LengthMax: int64(maximum),
+			Direction: direction,
+			DelayMin:  int64(delayMinimum),
+			DelayMax:  int64(delayMaximum),
+		})
+	}
+	if err := config.ValidatePadding(); err != nil {
+		return nil, fmt.Errorf("minecraft padding: %w", err)
+	}
+
+	var yggdrasil *xmc.Yggdrasil
+	if c.Yggdrasil != nil {
+		if c.Yggdrasil.API == "" {
+			return nil, fmt.Errorf("empty minecraft yggdrasil api")
+		}
+
+		apiURL, err := url.Parse(c.Yggdrasil.API)
+		if err != nil {
+			return nil, fmt.Errorf("invalid minecraft yggdrasil api: %w", err)
+		}
+		if apiURL.Scheme != "http" && apiURL.Scheme != "https" {
+			return nil, fmt.Errorf("invalid minecraft yggdrasil api scheme: %q", apiURL.Scheme)
+		}
+		if apiURL.Host == "" {
+			return nil, fmt.Errorf("invalid minecraft yggdrasil api: missing host")
+		}
+		if apiURL.RawQuery != "" || apiURL.Fragment != "" {
+			return nil, fmt.Errorf("invalid minecraft yggdrasil api: query and fragment are not allowed")
+		}
+		if (c.Yggdrasil.Username == "") != (c.Yggdrasil.Password == "") {
+			return nil, fmt.Errorf("minecraft yggdrasil username and password must be set together")
+		}
+		if c.Yggdrasil.Player != "" && !xmcUsernamePattern.MatchString(c.Yggdrasil.Player) {
+			return nil, fmt.Errorf("invalid minecraft yggdrasil player: %q", c.Yggdrasil.Player)
+		}
+
+		yggdrasil = &xmc.Yggdrasil{
+			Api:      strings.TrimSuffix(c.Yggdrasil.API, "/"),
+			Username: c.Yggdrasil.Username,
+			Password: c.Yggdrasil.Password,
+			Player:   c.Yggdrasil.Player,
+		}
+	} else if len(c.Profiles) == 0 {
 		return nil, fmt.Errorf("minecraft profiles are required")
 	}
 
-	if c.Password == "" {
-		return nil, fmt.Errorf("empty password")
-	}
+	var (
+		rsaPrivateKey *rsa.PrivateKey
+		password      string
+	)
+	if yggdrasil != nil {
+		// Yggdrasil mode binds the transport through the session hash: the
+		// client joins with the server's actual public key and the server
+		// checks hasJoined. The key pair is therefore generated per process
+		// instead of being derived from the password.
+		generated, err := rsa.GenerateKey(rand.Reader, 1024)
+		if err != nil {
+			return nil, fmt.Errorf("generate minecraft rsa key: %w", err)
+		}
+		rsaPrivateKey = generated
 
-	rsaPrivateKey, err := xmc.DeriveRSAKey(c.Password)
-	if err != nil {
-		return nil, fmt.Errorf("derive minecraft rsa key: %w", err)
+		warning := `XMC: Yggdrasil mode is enabled. The RSA key pair is generated randomly and "password" is no longer used to derive it or to authenticate the transport; players are verified through ` + yggdrasil.Api + ` (client /join, server /hasJoined). Both ends must be able to reach the Yggdrasil API.`
+		if c.Password != "" {
+			warning += ` The configured "password" is ignored.`
+		}
+		errors.LogWarning(context.Background(), warning)
+	} else {
+		if c.Password == "" {
+			return nil, fmt.Errorf("empty password")
+		}
+		if len(c.Password) > xmc.MaxLegacyPasswordLength {
+			return nil, fmt.Errorf("minecraft password is longer than %d bytes", xmc.MaxLegacyPasswordLength)
+		}
+		derived, err := xmc.DeriveRSAKey(c.Password)
+		if err != nil {
+			return nil, fmt.Errorf("derive minecraft rsa key: %w", err)
+		}
+		rsaPrivateKey = derived
+		password = c.Password
 	}
 
 	rsaPublicKey, err := x509.MarshalPKIXPublicKey(&rsaPrivateKey.PublicKey)
@@ -931,13 +1156,12 @@ func (c *XMC) Build() (proto.Message, error) {
 		profiles = append(profiles, profile)
 	}
 
-	return &xmc.Config{
-		Password:      c.Password,
-		Hostname:      c.Hostname,
-		RsaPrivateKey: x509.MarshalPKCS1PrivateKey(rsaPrivateKey),
-		RsaPublicKey:  rsaPublicKey,
-		Profiles:      profiles,
-	}, nil
+	config.Password = password
+	config.RsaPrivateKey = x509.MarshalPKCS1PrivateKey(rsaPrivateKey)
+	config.RsaPublicKey = rsaPublicKey
+	config.Profiles = profiles
+	config.Yggdrasil = yggdrasil
+	return config, nil
 }
 
 type Xicmp struct {
@@ -1147,6 +1371,91 @@ type QuicParamsConfig struct {
 	DisableGSO                    bool      `json:"disableGSO"`
 	MaxIncomingStreams            int64     `json:"maxIncomingStreams"`
 	DisableStatelessReset         bool      `json:"disableStatelessReset"`
+}
+
+func (config *QuicParamsConfig) Build() (proto.Message, error) {
+	profile := strings.ToLower(config.BbrProfile)
+	switch profile {
+	case "", string(bbr.ProfileConservative), string(bbr.ProfileStandard), string(bbr.ProfileAggressive):
+		if profile == "" {
+			profile = string(bbr.ProfileStandard)
+		}
+	default:
+		return nil, errors.New("unknown bbr profile")
+	}
+
+	up, err := config.BrutalUp.Bps()
+	if err != nil {
+		return nil, err
+	}
+	down, err := config.BrutalDown.Bps()
+	if err != nil {
+		return nil, err
+	}
+
+	if up > 0 && up < 65536 {
+		return nil, errors.New("BrutalUp must be at least 65536 bytes per second")
+	}
+	if down > 0 && down < 65536 {
+		return nil, errors.New("BrutalDown must be at least 65536 bytes per second")
+	}
+
+	config.Congestion = strings.ToLower(config.Congestion)
+	switch config.Congestion {
+	case "", "brutal", "reno", "bbr":
+	case "force-brutal":
+		if up == 0 {
+			return nil, errors.New("force-brutal requires up")
+		}
+	default:
+		return nil, errors.New("unknown congestion control: ", config.Congestion, ", valid values: reno, bbr, brutal, force-brutal")
+	}
+
+	if config.InitStreamReceiveWindow > 0 && config.InitStreamReceiveWindow < 16384 {
+		return nil, errors.New("InitStreamReceiveWindow must be at least 16384")
+	}
+	if config.MaxStreamReceiveWindow > 0 && config.MaxStreamReceiveWindow < 16384 {
+		return nil, errors.New("MaxStreamReceiveWindow must be at least 16384")
+	}
+	if config.InitConnectionReceiveWindow > 0 && config.InitConnectionReceiveWindow < 16384 {
+		return nil, errors.New("InitConnectionReceiveWindow must be at least 16384")
+	}
+	if config.MaxConnectionReceiveWindow > 0 && config.MaxConnectionReceiveWindow < 16384 {
+		return nil, errors.New("MaxConnectionReceiveWindow must be at least 16384")
+	}
+	if config.MaxIdleTimeout != 0 && (config.MaxIdleTimeout < 4 || config.MaxIdleTimeout > 120) {
+		return nil, errors.New("MaxIdleTimeout must be between 4 and 120")
+	}
+	if config.KeepAlivePeriod != 0 && (config.KeepAlivePeriod < 2 || config.KeepAlivePeriod > 60) {
+		return nil, errors.New("KeepAlivePeriod must be between 2 and 60")
+	}
+	if config.MaxIncomingStreams != 0 && config.MaxIncomingStreams < 8 {
+		return nil, errors.New("MaxIncomingStreams must be at least 8")
+	}
+
+	if config.Debug {
+		os.Setenv("HYSTERIA_BBR_DEBUG", "true")
+		os.Setenv("HYSTERIA_BRUTAL_DEBUG", "true")
+	}
+
+	return &internet.QuicParams{
+		Congestion:                    config.Congestion,
+		BbrProfile:                    profile,
+		BrutalUp:                      up,
+		BrutalDown:                    down,
+		BrutalDisableLossCompensation: config.BrutalDisableLossCompensation,
+		InitStreamReceiveWindow:       config.InitStreamReceiveWindow,
+		MaxStreamReceiveWindow:        config.MaxStreamReceiveWindow,
+		InitConnReceiveWindow:         config.InitConnectionReceiveWindow,
+		MaxConnReceiveWindow:          config.MaxConnectionReceiveWindow,
+		MaxIdleTimeout:                config.MaxIdleTimeout,
+		KeepAlivePeriod:               config.KeepAlivePeriod,
+		DisablePathMtuDiscovery:       config.DisablePathMTUDiscovery,
+		DisableChromeParrot:           config.DisableChromeParrot,
+		DisableGSO:                    config.DisableGSO,
+		MaxIncomingStreams:            config.MaxIncomingStreams,
+		DisableStatelessReset:         config.DisableStatelessReset,
+	}, nil
 }
 
 type FinalMask struct {
